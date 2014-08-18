@@ -1,0 +1,294 @@
+#!/bin/bash
+
+dasd='334a' # DASD address
+frmt='cdl'  # DASD format ('cdl' or 'ldl')
+fstp='ext4' # DASD filesystem type
+mntd='/mnt' # mount point
+
+blksz=4096
+blks2cp=3
+
+dev_dasd=''
+
+query='no'
+
+say() {
+	echo "$@" >&2
+}
+
+error() {
+	local -i rc=$1 ; shift
+	say "$@"
+	exit $rc
+}
+
+tmpf="/tmp/mkdasd.$$.tmp"
+touch "$tmpf"
+
+cleanup() {
+	say "* Some cleanup tasks ..."
+	rm -f "$tmpf"
+	for f in sys proc dev test; do umount -v "$mntd/$f"; done
+	if [ "$(pwd)" = "$mntd" ]; then
+		cd / || error 1 "Cannot cd / (rc=$?)."
+	fi
+	umount -v "$mntd"
+	say '* The end.'
+}
+
+clone_system() {
+	[ "$(pwd)" != "$mntd" ] && error 1 "Ooops! cwd='$(pwd)' is not '$mntd'."
+	find / -xdev -depth | grep -v "^$mntd" | cpio -d -m -p .
+}
+
+is_ldl() {
+	dasdview -x "$dev_dasd" | grep '^format' | grep -q 'LDL formatted$'
+}
+
+is_cdl() {
+	dasdview -x "$dev_dasd" | grep '^format' | grep -q 'CDL formatted$'
+}
+
+get_3_blocks() {
+	local dev="$1"
+	local file="$2"
+	[ -b "$dev" ] || error 1 "No block dev '$dev' for dd(1)."
+	: dd if="$dev" of="$file" bs=$blksz count=$blks2cp
+}
+
+lbs=0 # logical block size
+pbs=0 # physical b.s.
+
+report_block_sizes() {
+	local Dasd=$(basename $dev_dasd)
+	local path="/sys/block/$Dasd/queue/"
+	local rlbs=$(< $path/logical_block_size)
+	local rpbs=$(< $path/physical_block_size)
+	say "* Device '$Dasd' ($dasd) has lbs=$rlbs and pbs=$rpbs."
+}
+
+save_block_sizes() {
+	local Dasd=$(basename $dev_dasd)
+	local path="/sys/block/$Dasd/queue/"
+	local rlbs=$(< $path/logical_block_size)
+	local rpbs=$(< $path/physical_block_size)
+	say "* Device '$Dasd' ($dasd) has lbs=$rlbs and pbs=$rpbs."
+	lbs=$rlbs
+	pbs=$rpbs
+}
+
+same_block_sizes() {
+	local Dasd=$(basename $dev_dasd)
+	local path="/sys/block/$Dasd/queue/"
+	local rlbs=$(< $path/logical_block_size)
+	local rpbs=$(< $path/physical_block_size)
+	say "* Device '$Dasd' ($dasd) has now lbs=$rlbs (was $lbs) and pbs=$rpbs (was $pbs)."
+	(( $lbs == $rlbs )) && (( $pbs == $rpbs ))
+}
+
+retry_command() {
+	local -i count="$1" ; shift
+	local -i sleep="$1" ; shift
+	local -i i=0
+	"$@" && return 0
+	for ((i=1; i<$count; i++)); do
+		sleep $sleep
+		"$@" && return 0
+	done
+	return 1
+}
+
+reset_dasd() {
+	retry_command 5 3 chccwdev -d "$dasd" || error $? "Cannot offline DASD '$dasd'."
+	retry_command 5 3 chccwdev -e "$dasd" || error $? "Cannot online DASD '$dasd'."
+}
+
+show_dasd() {
+	echo .
+	lsdasd -a -l "$dasd"
+	echo .
+	fdisk -l "$dev_dasd"
+	if is_cdl; then
+		echo .
+		fdasd -r -p "$dev_dasd"
+	fi
+	echo .
+	dasdinfo -a -d "$dev_dasd"
+	echo .
+	dasdstat -V -l $(basename $dev_dasd) 0.0.$dasd
+	echo .
+	dasdview -x $dev_dasd | grep -v '^ '
+}
+
+exe="$0"
+cmd=$(basename "$exe")
+HELP="$cmd [-d <dasd=$dasd>] [-q] [-l cdl|ldl] [-f <FS-type=$fstp>] [-m <mountpoint=$mntd>]\nDASDFMT=[$DASDFMT]"
+while [ -n "$1" ]; do
+	case "$1" in
+	-h|--help)	error 0 -e "$HELP";;
+	-d|--dasd)	shift; dasd="$1";;
+	-l|--layout)	shift; frmt="$1";;
+	-f|--fstype)	shift; fstp="$1";;
+	-m|--use)	shift; mntd="$1";;
+	-q|--query)	shift; query='yes';;
+	*)	error 1 "What's '$1'?";;
+	esac
+	shift
+done
+
+case "$frmt" in
+cdl)	;;
+ldl)	;;
+n*|N*)	frmt='none';;
+*)	error 1 "Unknown layout '$frmt'.";;
+esac
+
+if [ "$query" = 'yes' ]; then
+	say "* Quering DASD '$dasd':"
+else
+	say "* About to format DASD '$dasd' to '$frmt' and make '$fstp' FS on it."
+	say "* Directory '$mntd' will be used as mount point."
+fi
+
+boot_dev=''
+dev_path="/dev/disk/by-path/ccw-0.0.$dasd"
+[ -L "$dev_path" ] || error 1 "No path '$dev_path'."
+
+dev_dasd=$(realpath "$dev_path")
+[ -b "$dev_dasd" ] || error 1 "No block special '$dev_dasd' for '$dev_path'."
+say "* '$dev_path' => '$dev_dasd'."
+report_block_sizes
+say -n "* DASD '$dasd' "
+if is_ldl; then
+	say "is LDL formatted."
+elif is_cdl; then
+	say "is CDL formatted."
+else
+	say "looks unformatted!"
+fi
+
+if mount | grep "^$dev_dasd"; then
+	say "Device '$dev_dasd' is already mounted."
+	[ "$query" != 'yes' ] && error 1 "!!"
+fi
+
+if mount | grep " on $mntd "; then
+	say "Directory '$mntd' is already mounted."
+	[ "$query" != 'yes' ] && error 1 "!!"
+fi
+
+rootfs=$(mount | grep ' on / ' | cut -d' ' -f1)
+[ "${rootfs:0:9}" != '/dev/dasd' ] && error 1 "Root FS '$rootfs' is not DASD-based - cannot clone."
+root_dev=${rootfs:0:10}
+here=$(pwd)
+cd /dev/disk/by-path/ || error 1 "Cannot chdir to '/dev/disk/by-path/' (rc=$?)."
+for r in *; do
+	# r == 'ccw-0.0.3348-part1'
+	d=$(realpath $r)
+	# d = '/dev/dasda1'
+	if [ "$d" = "$rootfs" ]; then
+		bus=$(echo "$r" | cut -d- -f1)
+		addr=$(echo "$r" | cut -d- -f2)
+		part=$(echo "$r" | cut -d- -f3)
+		[ "$bus" != 'ccw' ] && error 1 "Boot device '$d' is not a CCW ($bus)."
+		boot_dev="$r"
+		break
+	fi
+done
+[ -z "$boot_dev" ] && error 1 "Cannot find boot DASD."
+say "* Current boot device is '$boot_dev'."
+cd "$here" || error 1 "Cannot chdir back to '$here' (rc=$?)."
+
+[ -w /etc/passwd ] || error 1 "You must be root to do that."
+
+if [ "$query" = 'yes' ]; then
+	show_dasd
+	exit 0
+fi
+
+read -p 'Almost last chance to stop! Type "yes" to continue: ' REPLY
+case "$REPLY" in
+yes|YES) ;;
+*) error 0 'Cancelled.'
+esac
+
+trap cleanup EXIT
+
+if [ "$frmt" != 'none' ]; then
+	save_block_sizes
+	dasdfmt -p -d "$frmt" $DASDFMT -f "$dev_dasd" || error 1 "Cannot format '$dev_dasd' to '$frmt' (rc=$?)."
+	say "* '$dev_dasd' has been formatted to '$frmt'."
+	sync
+	if ! same_block_sizes; then
+		reset_dasd || error $? "Cannot reset DASD '$dasd'."
+	fi
+	part="$dev_dasd"1
+	get_3_blocks "$dev_dasd" ~/"dev.$dasd.fmt.bin"
+	if [ "$frmt" = 'cdl' ]; then
+		sleep 3 # no way to run it instantly!
+		fdasd -r -a "$dev_dasd" || error 1 "Cannot partition (rc=$?)."
+		say "* '$dev_dasd' has been partitioned as '$part'."
+		get_3_blocks "$dev_dasd" ~/"dev.$dasd.part.bin"
+	fi
+	sync
+	sleep 1
+else
+	part="$dev_dasd"1
+	say "* '$dev_dasd' format retained."
+fi
+[ -b "$part" ] || error 1 "No block special '$part'."
+
+mkfs -t "$fstp" "$part" || error 1 "Error creating '$fstp' on '$part' (rc=$?)."
+get_3_blocks "$dev_dasd" ~/"dev.$dasd.fs.bin"
+say "* Filesystem '$fstp' has been created on '$part'."
+sync
+
+mount "$part" "$mntd" || error 1 "Cannot mount '$part' on '$mntd' (rc=$?)."
+say "* Cloning current system to '$part' on '$mntd'..."
+cd "$mntd" || error 1 "Cannot chdir to '$mntd' (rc=$?)."
+clone_system || error 1 "Error cloning system to '$mntd' (rc=$?)."
+sync
+
+[ -d "$mntd/etc/." ] || error 1 "No '$mntd/etc/' here..."
+[ -f "$mntd/etc/fstab" ] || error 1 "No '$mntd/etc/fstab' here..."
+[ -f "$mntd/etc/zipl.conf" ] || error 1 "No '$mntd/etc/zipl.conf' here..."
+[ -f "$mntd/etc/dasd.conf" ] || say "WARNING: No '$mntd/etc/dasd.conf' here..."
+
+grep -v '^/' "$mntd/etc/fstab" > "$tmpf" # proc, sys, etc...
+grep '^/' "$mntd/etc/fstab" | grep -v 'swap' >> "$tmpf" # no swap here!
+addr=$(echo "$boot_dev" | cut -d- -f2 | cut -d. -f3)
+#       "ccw-0.0.abcd"  | "0.0.abcd"  | "abcd"
+sed -e "1,\$s/$addr/$dasd/g" -i "$tmpf" || error 1 "Cannot edit fstab."
+cat "$tmpf" > "$mntd/etc/fstab" # write over
+say "* Root FS will be '$(grep " / " "$mntd/etc/fstab")'."
+sync
+
+cp "$mntd/etc/zipl.conf" "$tmpf" || error 1 "Cannot cp zipl.conf to '$tmpf' (rc=$?)."
+sed -e "1,\$s/$addr/$dasd/g" -i "$tmpf" || error 1 "Cannot edit zipl.conf."
+cat "$tmpf" > "$mntd/etc/zipl.conf" # write over
+say "* zIPL will see '$(grep "$dasd" "$mntd/etc/zipl.conf")'."
+sync
+
+if [ -f "$mntd/etc/dasd.conf" ]; then
+    if grep -q "^0.0.$addr" "$mntd/etc/dasd.conf"; then
+        cat "$mntd/etc/dasd.conf" > "$tmpf"
+        sed -e "1,\$s/$addr/$dasd/g" -i "$tmpf" || error 1 "Cannot edit dasd.conf."
+        cat "$tmpf" > "$mntd/etc/dasd.conf" # write over
+        say "* DASD config updated s/$addr/$dasd/:"
+        sed -e '1,$s/^.*$/>> [&]/' < "$mntd/etc/dasd.conf"
+    else
+        say "* No root DASD '$addr' entry in /etc/dasd.conf :"
+        sed -e '1,$s/^.*$/>> [&]/' < "$mntd/etc/dasd.conf"
+    fi
+fi
+
+for f in sys proc dev test; do mount -v -o bind "/$f" "$mntd/$f"; done
+
+say "!!! Now run 'zipl' and 'exit'..."
+chroot "$mntd" || error 1 "Cannot chroot to '$mntd' (rc=$?)."
+get_3_blocks "$dev_dasd" ~/"dev.$dasd.zipl.bin"
+
+say "* Looks like you're done with '$dasd' DASD."
+show_dasd
+
+# EOF #
